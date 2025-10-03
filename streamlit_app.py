@@ -1,7 +1,7 @@
-import os
-import json
 import time
 import sqlite3
+import re
+import math
 from datetime import datetime, date
 from typing import Optional, Tuple, List
 
@@ -17,11 +17,70 @@ st.set_page_config(page_title="Aziatische hoornaar - Nesten (GBIF)", layout="wid
 
 ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", "")  # in .streamlit/secrets.toml
 DB_PATH = "notes.db"
-VESPA_VELUTINA_TAXONKEY = 1311006  # GBIF taxonKey
+# Correct GBIF taxonKey for Vespa velutina (Yellow-legged hornet)
+VESPA_VELUTINA_TAXONKEY = 1311477
 DEFAULT_COUNTRY = "NL"
 
 # ’s-Hertogenbosch benaderende bbox (ruim genomen) -> minLon, minLat, maxLon, maxLat
 DEN_BOSCH_BBOX = (5.215, 51.63, 5.40, 51.76)
+MAP_WIDGET_KEY = "occurrence_map"
+
+
+def ensure_bbox_defaults():
+    if "bbox_min_lon" not in st.session_state:
+        st.session_state["bbox_min_lon"] = DEN_BOSCH_BBOX[0]
+    if "bbox_min_lat" not in st.session_state:
+        st.session_state["bbox_min_lat"] = DEN_BOSCH_BBOX[1]
+    if "bbox_max_lon" not in st.session_state:
+        st.session_state["bbox_max_lon"] = DEN_BOSCH_BBOX[2]
+    if "bbox_max_lat" not in st.session_state:
+        st.session_state["bbox_max_lat"] = DEN_BOSCH_BBOX[3]
+    if "use_denbosch" not in st.session_state:
+        st.session_state["use_denbosch"] = True
+
+
+def bbox_from_session() -> Tuple[float, float, float, float]:
+    return (
+        float(st.session_state["bbox_min_lon"]),
+        float(st.session_state["bbox_min_lat"]),
+        float(st.session_state["bbox_max_lon"]),
+        float(st.session_state["bbox_max_lat"]),
+    )
+
+
+def sync_bbox_from_map_event() -> None:
+    """Update stored bbox if the user moved the map and bounds are available."""
+
+    map_state = st.session_state.get(MAP_WIDGET_KEY)
+    if not map_state:
+        return
+
+    viewport = map_state.get("viewport")
+    if not isinstance(viewport, dict):
+        return
+
+    bounds = viewport.get("bounds")
+    if not bounds or len(bounds) != 2:
+        return
+
+    (min_lon, min_lat), (max_lon, max_lat) = bounds
+    if None in (min_lon, min_lat, max_lon, max_lat):
+        return
+
+    new_bbox = tuple(round(float(val), 6) for val in (min_lon, min_lat, max_lon, max_lat))
+    current_bbox = bbox_from_session()
+
+    if all(math.isclose(a, b, abs_tol=1e-6) for a, b in zip(new_bbox, current_bbox)):
+        return
+
+    (
+        st.session_state["bbox_min_lon"],
+        st.session_state["bbox_min_lat"],
+        st.session_state["bbox_max_lon"],
+        st.session_state["bbox_max_lat"],
+    ) = new_bbox
+    st.session_state["use_denbosch"] = False
+    st.session_state["pending_refresh"] = True
 
 # ---------------------------------
 # DB helpers
@@ -83,6 +142,19 @@ def fetch_gbif_occurrences(
     Haalt occurrences op uit GBIF en normaliseert naar kolommen: id, lat, lon, date, location, reporter.
     Pagineert tot max_records.
     """
+    expected_columns = [
+        "id",
+        "lat",
+        "lon",
+        "date",
+        "location",
+        "reporter",
+        "countryCode",
+        "basisOfRecord",
+        "datasetKey",
+        "occurrenceID",
+    ]
+
     records: List[dict] = []
     offset = 0
     page_size = 300  # GBIF limiet tot 300
@@ -123,6 +195,7 @@ def fetch_gbif_occurrences(
                 "countryCode": occ.get("countryCode"),
                 "basisOfRecord": occ.get("basisOfRecord"),
                 "datasetKey": occ.get("datasetKey"),
+                "occurrenceID": occ.get("occurrenceID"),
             })
             if len(records) >= max_records:
                 break
@@ -130,9 +203,9 @@ def fetch_gbif_occurrences(
             break
         offset += page_size
 
-    df = pd.DataFrame.from_records(records)
+    df = pd.DataFrame.from_records(records, columns=expected_columns)
     if df.empty:
-        return df
+        return pd.DataFrame(columns=expected_columns)
 
     # Normalisatie van types
     df["id"] = df["id"].astype(str)
@@ -146,6 +219,9 @@ def fetch_gbif_occurrences(
         except Exception:
             return None
     df["date"] = df["date"].apply(to_date)
+
+    if "occurrenceID" in df.columns:
+        df["occurrenceID"] = df["occurrenceID"].apply(lambda val: str(val) if pd.notna(val) else None)
 
     # Alleen met geldige coords
     df = df[pd.notna(df["lat"]) & pd.notna(df["lon"])].reset_index(drop=True)
@@ -163,6 +239,58 @@ def bbox_to_wkt_polygon(min_lon, min_lat, max_lon, max_lat) -> str:
         f"{min_lon} {min_lat}"
         "))"
     )
+
+
+ACTIVITY_PATTERN = re.compile(r"<th>\s*(?:Activity|Activiteit)\s*</th>\s*<td>([^<]+)</td>", re.IGNORECASE)
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def fetch_observation_activity(occurrence_url: Optional[str]) -> Optional[str]:
+    """Return the activity label from the linked Observation.org page if available."""
+
+    if not occurrence_url or "observation.org/observation/" not in occurrence_url:
+        return None
+
+    headers = {"User-Agent": "waarneming-app/1.0 (+https://waarneming.nl)"}
+    try:
+        response = requests.get(occurrence_url, headers=headers, timeout=10)
+        response.raise_for_status()
+    except requests.RequestException:
+        return None
+
+    match = ACTIVITY_PATTERN.search(response.text)
+    if match:
+        return match.group(1).strip()
+    return None
+
+
+def ensure_activity_column(df: pd.DataFrame) -> pd.DataFrame:
+    """Populate an ``activity`` column by scraping Observation.org when needed."""
+
+    if df.empty:
+        if "activity" not in df.columns:
+            df = df.copy()
+            df["activity"] = pd.NA
+        return df
+
+    if "occurrenceID" not in df.columns:
+        df = df.copy()
+        df["activity"] = pd.NA
+        return df
+
+    df = df.copy()
+    if "activity" not in df.columns:
+        df["activity"] = pd.NA
+
+    mask = df["occurrenceID"].notna() & df["activity"].isna()
+    if not mask.any():
+        return df
+
+    for idx, url in df.loc[mask, "occurrenceID"].items():
+        activity = fetch_observation_activity(url)
+        df.at[idx, "activity"] = activity if activity is not None else ""
+
+    return df
 
 # ---------------------------------
 # Auth
@@ -190,6 +318,8 @@ def can_edit() -> bool:
 # ---------------------------------
 def main():
     init_db()
+    ensure_bbox_defaults()
+    sync_bbox_from_map_event()
 
     st.title("Nesten Aziatische hoornaar – via GBIF")
     st.caption("Toont waarnemingen (occurrences) van Vespa velutina en bewaart je eigen statussen/opmerkingen lokaal (SQLite).")
@@ -200,21 +330,61 @@ def main():
         country = None if country == "None" else country
 
         st.markdown("**Datumrange (eventDate)**")
+        apply_date_filter = st.checkbox("Filter op datumrange", value=False)
         col_a, col_b = st.columns(2)
         with col_a:
-            date_from = st.date_input("Vanaf", value=None)
+            date_from = st.date_input("Vanaf", value=None, disabled=not apply_date_filter)
         with col_b:
-            date_to = st.date_input("Tot en met", value=None)
+            date_to = st.date_input("Tot en met", value=None, disabled=not apply_date_filter)
 
         st.markdown("**Gebied (ENVELOPE bbox)**")
-        use_denbosch = st.checkbox("Gebruik preset ’s-Hertogenbosch", value=True)
+        use_denbosch = st.checkbox(
+            "Gebruik preset ’s-Hertogenbosch",
+            value=st.session_state.get("use_denbosch", True),
+            key="use_denbosch",
+        )
         if use_denbosch:
-            min_lon, min_lat, max_lon, max_lat = DEN_BOSCH_BBOX
-        else:
-            min_lon = st.number_input("minLon", value=5.215, format="%.6f")
-            min_lat = st.number_input("minLat", value=51.630, format="%.6f")
-            max_lon = st.number_input("maxLon", value=5.400, format="%.6f")
-            max_lat = st.number_input("maxLat", value=51.760, format="%.6f")
+            (
+                st.session_state["bbox_min_lon"],
+                st.session_state["bbox_min_lat"],
+                st.session_state["bbox_max_lon"],
+                st.session_state["bbox_max_lat"],
+            ) = DEN_BOSCH_BBOX
+
+        col_lon, col_lat = st.columns(2)
+        with col_lon:
+            st.number_input(
+                "minLon",
+                value=st.session_state["bbox_min_lon"],
+                key="bbox_min_lon",
+                format="%.6f",
+                disabled=use_denbosch,
+            )
+            st.number_input(
+                "maxLon",
+                value=st.session_state["bbox_max_lon"],
+                key="bbox_max_lon",
+                format="%.6f",
+                disabled=use_denbosch,
+            )
+        with col_lat:
+            st.number_input(
+                "minLat",
+                value=st.session_state["bbox_min_lat"],
+                key="bbox_min_lat",
+                format="%.6f",
+                disabled=use_denbosch,
+            )
+            st.number_input(
+                "maxLat",
+                value=st.session_state["bbox_max_lat"],
+                key="bbox_max_lat",
+                format="%.6f",
+                disabled=use_denbosch,
+            )
+
+        st.markdown("**Activiteit**")
+        only_nests = st.checkbox("Alleen nesten", value=False, help="Filtert waarnemingen waar Activity = 'nest' op Observation.org")
 
         max_records = st.slider("Max records", 100, 5000, 1000, step=100)
 
@@ -222,20 +392,48 @@ def main():
         st.caption("Klik ‘Verversen’ om filters toe te passen.")
         refresh = st.button("Verversen", type="primary")
 
+    if st.session_state.pop("pending_refresh", False):
+        refresh = True
+
+    date_from_value = date_from if apply_date_filter and isinstance(date_from, date) else None
+    date_to_value = date_to if apply_date_filter and isinstance(date_to, date) else None
+    min_lon, min_lat, max_lon, max_lat = bbox_from_session()
+
     # Data ophalen
     if "df" not in st.session_state or refresh or "last_params" not in st.session_state:
         df = fetch_gbif_occurrences(
             taxon_key=VESPA_VELUTINA_TAXONKEY,
             country=country,
             geometry_envelope=(min_lon, min_lat, max_lon, max_lat),
-            date_from=date_from if isinstance(date_from, date) else None,
-            date_to=date_to if isinstance(date_to, date) else None,
+            date_from=date_from_value,
+            date_to=date_to_value,
             max_records=max_records
         )
         st.session_state["df"] = df
-        st.session_state["last_params"] = (country, (min_lon, min_lat, max_lon, max_lat), date_from, date_to, max_records)
+        st.session_state["last_params"] = (
+            country,
+            (min_lon, min_lat, max_lon, max_lat),
+            date_from_value,
+            date_to_value,
+            max_records,
+            apply_date_filter,
+        )
     else:
         df = st.session_state["df"]
+
+    if only_nests:
+        base_df = st.session_state["df"]
+        needs_activity = "activity" not in base_df.columns or base_df["activity"].isna().any()
+        if needs_activity:
+            with st.spinner("Activiteiten ophalen voor nestfilter..."):
+                enriched = ensure_activity_column(base_df)
+            st.session_state["df"] = enriched
+        else:
+            enriched = base_df
+        df = enriched
+        df = df[df["activity"].fillna("").str.lower().str.contains("nest")].reset_index(drop=True)
+    else:
+        df = df.copy()
 
     # Merge met notities
     notes_df = fetch_notes()
@@ -251,16 +449,25 @@ def main():
         else:
             # Kaartweergave (kleur op status)
             show_df = merged.copy()
+            if "activity" not in show_df.columns:
+                show_df["activity"] = ""
+            show_df["date"] = show_df["date"].apply(
+                lambda val: val.isoformat() if isinstance(val, date) else ""
+            )
             def status_display(row):
                 return row["status"] if pd.notna(row.get("status")) else "(leeg)"
             show_df["status_display"] = show_df.apply(status_display, axis=1)
-            show_df["color"] = show_df["status_display"].map({
-                "Verwijderd": [30,150,30],
-                "Onvindbaar": [200,100,0],
-                "Anders": [100,100,200],
-                "Open": [200,30,30],
-                "(leeg)": [120,120,120]
-            }).fillna([120,120,120])
+            status_colors = {
+                "Verwijderd": [30, 150, 30],
+                "Onvindbaar": [200, 100, 0],
+                "Anders": [100, 100, 200],
+                "Open": [200, 30, 30],
+                "(leeg)": [120, 120, 120],
+            }
+            default_color = status_colors["(leeg)"]
+            show_df["color"] = show_df["status_display"].map(status_colors).apply(
+                lambda value: value if isinstance(value, list) else default_color
+            )
 
             st.pydeck_chart(pdk.Deck(
                 map_style=None,
@@ -280,8 +487,8 @@ def main():
                         pickable=True
                     )
                 ],
-                tooltip={"text": "ID: {id}\nDatum: {date}\nStatus: {status_display}\nLocatie: {location}"}
-            ))
+                tooltip={"text": "ID: {id}\nDatum: {date}\nActiviteit: {activity}\nStatus: {status_display}\nLocatie: {location}"}
+            ), key=MAP_WIDGET_KEY)
     with right:
         st.subheader("Telling")
         total = len(merged)
@@ -293,17 +500,32 @@ def main():
 
     st.subheader("Meldingen")
     # Client-side tekstfilter
-    text_filter = st.text_input("Zoek (id/loc/reporter)", "")
+    text_filter = st.text_input("Zoek (id/loc/reporter/activiteit)", "")
     list_df = merged.copy()
     if text_filter.strip():
         t = text_filter.lower()
         hay = pd.Series([""] * len(list_df))
-        for col in ["id","location","reporter"]:
+        for col in ["id", "location", "reporter", "activity"]:
             if col in list_df.columns:
                 hay = hay.str.cat(list_df[col].fillna("").astype(str).str.lower(), sep="|")
         list_df = list_df[hay.str.contains(t, na=False)]
 
-    show_cols = [c for c in ["id","date","status","reporter","location","lat","lon","basisOfRecord","countryCode"] if c in list_df.columns]
+    show_cols = [
+        c
+        for c in [
+            "id",
+            "date",
+            "activity",
+            "status",
+            "reporter",
+            "location",
+            "lat",
+            "lon",
+            "basisOfRecord",
+            "countryCode",
+        ]
+        if c in list_df.columns
+    ]
     st.dataframe(list_df[show_cols].sort_values(by="date", ascending=False), use_container_width=True, hide_index=True)
 
     st.divider()
