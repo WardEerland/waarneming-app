@@ -1,25 +1,28 @@
 import time
 import sqlite3
-import re
 import math
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from typing import Optional, Tuple, List
 
 import pandas as pd
-import requests
 import streamlit as st
 import pydeck as pdk
+
+from waarneming_scraper import (
+    fetch_waarneming_occurrences,
+    WaarnemingScraperError,
+)
 
 # ---------------------------------
 # Config
 # ---------------------------------
-st.set_page_config(page_title="Aziatische hoornaar - Nesten (GBIF)", layout="wide")
+st.set_page_config(page_title="Aziatische hoornaar - Nesten (Waarneming.nl)", layout="wide")
 
 ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", "")  # in .streamlit/secrets.toml
 DB_PATH = "notes.db"
-# Correct GBIF taxonKey for Vespa velutina (Yellow-legged hornet)
-VESPA_VELUTINA_TAXONKEY = 1311477
-DEFAULT_COUNTRY = "NL"
+WAARNEMING_SPECIES_ID = 8807
+DEFAULT_LOCATION_QUERY = "s-Hertogenbosch"
+DEFAULT_HISTORY_DAYS = 90
 
 # ’s-Hertogenbosch benaderende bbox (ruim genomen) -> minLon, minLat, maxLon, maxLat
 DEN_BOSCH_BBOX = (5.215, 51.63, 5.40, 51.76)
@@ -35,8 +38,6 @@ def ensure_bbox_defaults():
         st.session_state["bbox_max_lon"] = DEN_BOSCH_BBOX[2]
     if "bbox_max_lat" not in st.session_state:
         st.session_state["bbox_max_lat"] = DEN_BOSCH_BBOX[3]
-    if "use_denbosch" not in st.session_state:
-        st.session_state["use_denbosch"] = True
 
 
 def bbox_from_session() -> Tuple[float, float, float, float]:
@@ -48,39 +49,83 @@ def bbox_from_session() -> Tuple[float, float, float, float]:
     )
 
 
-def sync_bbox_from_map_event() -> None:
-    """Update stored bbox if the user moved the map and bounds are available."""
+def viewport_to_bbox(viewport: Optional[dict]) -> Optional[Tuple[float, float, float, float]]:
+    if not viewport or not isinstance(viewport, dict):
+        return None
 
-    map_state = st.session_state.get(MAP_WIDGET_KEY)
-    if not map_state:
-        return
+    try:
+        lon = float(viewport["longitude"])
+        lat = float(viewport["latitude"])
+    except (KeyError, TypeError, ValueError):
+        return None
 
-    viewport = map_state.get("viewport")
-    if not isinstance(viewport, dict):
-        return
+    zoom = float(viewport.get("zoom", 10.0))
+    width = float(viewport.get("width") or viewport.get("viewport_width") or 900)
+    height = float(viewport.get("height") or viewport.get("viewport_height") or 600)
 
-    bounds = viewport.get("bounds")
-    if not bounds or len(bounds) != 2:
-        return
+    lat_rad = math.radians(lat)
+    # Avoid divide-by-zero near the poles
+    cos_lat = max(math.cos(lat_rad), 1e-6)
 
-    (min_lon, min_lat), (max_lon, max_lat) = bounds
-    if None in (min_lon, min_lat, max_lon, max_lat):
-        return
+    meters_per_pixel = 156543.03392 * cos_lat / (2 ** zoom)
+    half_width_m = meters_per_pixel * width / 2
+    half_height_m = meters_per_pixel * height / 2
 
-    new_bbox = tuple(round(float(val), 6) for val in (min_lon, min_lat, max_lon, max_lat))
+    earth_radius = 6_378_137.0  # meters
+    lat_delta = (half_height_m / earth_radius) * (180 / math.pi)
+    lon_delta = (half_width_m / (earth_radius * cos_lat)) * (180 / math.pi)
+
+    min_lat = max(-90.0, lat - lat_delta)
+    max_lat = min(90.0, lat + lat_delta)
+    min_lon = lon - lon_delta
+    max_lon = lon + lon_delta
+
+    if min_lon < -180.0:
+        min_lon += 360.0
+    if max_lon > 180.0:
+        max_lon -= 360.0
+
+    return (
+        round(min_lon, 6),
+        round(min_lat, 6),
+        round(max_lon, 6),
+        round(max_lat, 6),
+    )
+
+
+def update_bbox_from_viewport(viewport: Optional[dict]) -> bool:
+    bbox = viewport_to_bbox(viewport)
+    if not bbox:
+        return False
+
     current_bbox = bbox_from_session()
-
-    if all(math.isclose(a, b, abs_tol=1e-6) for a, b in zip(new_bbox, current_bbox)):
-        return
+    if all(math.isclose(a, b, abs_tol=1e-6) for a, b in zip(bbox, current_bbox)):
+        return False
 
     (
         st.session_state["bbox_min_lon"],
         st.session_state["bbox_min_lat"],
         st.session_state["bbox_max_lon"],
         st.session_state["bbox_max_lat"],
-    ) = new_bbox
-    st.session_state["use_denbosch"] = False
-    st.session_state["pending_refresh"] = True
+    ) = bbox
+    return True
+
+
+def current_map_viewport() -> Optional[dict]:
+    state = st.session_state.get(MAP_WIDGET_KEY)
+    if not isinstance(state, dict):
+        return None
+
+    for key in ("viewport", "view_state", "last_view_state"):
+        candidate = state.get(key)
+        if isinstance(candidate, dict):
+            return candidate
+
+    # Fallback: some Streamlit versions store the values directly on the dict.
+    if {"latitude", "longitude"}.issubset(state.keys()):
+        return state
+
+    return None
 
 # ---------------------------------
 # DB helpers
@@ -122,177 +167,6 @@ def fetch_notes() -> pd.DataFrame:
     return df
 
 # ---------------------------------
-# GBIF fetch
-# ---------------------------------
-def _gbif_page(params: dict) -> dict:
-    r = requests.get("https://api.gbif.org/v1/occurrence/search", params=params, timeout=25)
-    r.raise_for_status()
-    return r.json()
-
-@st.cache_data(show_spinner=True, ttl=3600)
-def fetch_gbif_occurrences(
-    taxon_key: int = VESPA_VELUTINA_TAXONKEY,
-    country: Optional[str] = DEFAULT_COUNTRY,
-    geometry_envelope: Optional[Tuple[float, float, float, float]] = None,
-    date_from: Optional[date] = None,
-    date_to: Optional[date] = None,
-    max_records: int = 1000
-) -> pd.DataFrame:
-    """
-    Haalt occurrences op uit GBIF en normaliseert naar kolommen: id, lat, lon, date, location, reporter.
-    Pagineert tot max_records.
-    """
-    expected_columns = [
-        "id",
-        "lat",
-        "lon",
-        "date",
-        "location",
-        "reporter",
-        "countryCode",
-        "basisOfRecord",
-        "datasetKey",
-        "occurrenceID",
-    ]
-
-    records: List[dict] = []
-    offset = 0
-    page_size = 300  # GBIF limiet tot 300
-
-    params = {
-        "taxonKey": taxon_key,
-        "hasCoordinate": "true",
-        "limit": page_size,
-        "offset": offset
-    }
-    if country:
-        params["country"] = country
-    if date_from or date_to:
-        # Formaat: YYYY-MM-DD,YYYY-MM-DD (range, beide kanten optioneel)
-        start_str = date_from.isoformat() if date_from else ""
-        end_str = date_to.isoformat() if date_to else ""
-        if start_str or end_str:
-            params["eventDate"] = f"{start_str},{end_str}"
-
-    if geometry_envelope:
-        min_lon, min_lat, max_lon, max_lat = geometry_envelope
-        params["geometry"] = bbox_to_wkt_polygon(min_lon, min_lat, max_lon, max_lat)
-
-    while len(records) < max_records:
-        params["offset"] = offset
-        data = _gbif_page(params)
-        page = data.get("results", [])
-        if not page:
-            break
-        for occ in page:
-            records.append({
-                "id": str(occ.get("key")),
-                "lat": occ.get("decimalLatitude"),
-                "lon": occ.get("decimalLongitude"),
-                "date": occ.get("eventDate"),
-                "location": occ.get("locality") or occ.get("verbatimLocality"),
-                "reporter": occ.get("recordedBy"),
-                "countryCode": occ.get("countryCode"),
-                "basisOfRecord": occ.get("basisOfRecord"),
-                "datasetKey": occ.get("datasetKey"),
-                "occurrenceID": occ.get("occurrenceID"),
-            })
-            if len(records) >= max_records:
-                break
-        if len(page) < page_size:
-            break
-        offset += page_size
-
-    df = pd.DataFrame.from_records(records, columns=expected_columns)
-    if df.empty:
-        return pd.DataFrame(columns=expected_columns)
-
-    # Normalisatie van types
-    df["id"] = df["id"].astype(str)
-    df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
-    df["lon"] = pd.to_numeric(df["lon"], errors="coerce")
-    def to_date(val):
-        if pd.isna(val):
-            return None
-        try:
-            return pd.to_datetime(val).date()
-        except Exception:
-            return None
-    df["date"] = df["date"].apply(to_date)
-
-    if "occurrenceID" in df.columns:
-        df["occurrenceID"] = df["occurrenceID"].apply(lambda val: str(val) if pd.notna(val) else None)
-
-    # Alleen met geldige coords
-    df = df[pd.notna(df["lat"]) & pd.notna(df["lon"])].reset_index(drop=True)
-    return df
-
-
-def bbox_to_wkt_polygon(min_lon, min_lat, max_lon, max_lat) -> str:
-    # lon, lat volgorde; tegen de klok in; sluit de ring
-    return (
-        "POLYGON(("
-        f"{min_lon} {min_lat},"
-        f"{max_lon} {min_lat},"
-        f"{max_lon} {max_lat},"
-        f"{min_lon} {max_lat},"
-        f"{min_lon} {min_lat}"
-        "))"
-    )
-
-
-ACTIVITY_PATTERN = re.compile(r"<th>\s*(?:Activity|Activiteit)\s*</th>\s*<td>([^<]+)</td>", re.IGNORECASE)
-
-
-@st.cache_data(show_spinner=False, ttl=3600)
-def fetch_observation_activity(occurrence_url: Optional[str]) -> Optional[str]:
-    """Return the activity label from the linked Observation.org page if available."""
-
-    if not occurrence_url or "observation.org/observation/" not in occurrence_url:
-        return None
-
-    headers = {"User-Agent": "waarneming-app/1.0 (+https://waarneming.nl)"}
-    try:
-        response = requests.get(occurrence_url, headers=headers, timeout=10)
-        response.raise_for_status()
-    except requests.RequestException:
-        return None
-
-    match = ACTIVITY_PATTERN.search(response.text)
-    if match:
-        return match.group(1).strip()
-    return None
-
-
-def ensure_activity_column(df: pd.DataFrame) -> pd.DataFrame:
-    """Populate an ``activity`` column by scraping Observation.org when needed."""
-
-    if df.empty:
-        if "activity" not in df.columns:
-            df = df.copy()
-            df["activity"] = pd.NA
-        return df
-
-    if "occurrenceID" not in df.columns:
-        df = df.copy()
-        df["activity"] = pd.NA
-        return df
-
-    df = df.copy()
-    if "activity" not in df.columns:
-        df["activity"] = pd.NA
-
-    mask = df["occurrenceID"].notna() & df["activity"].isna()
-    if not mask.any():
-        return df
-
-    for idx, url in df.loc[mask, "occurrenceID"].items():
-        activity = fetch_observation_activity(url)
-        df.at[idx, "activity"] = activity if activity is not None else ""
-
-    return df
-
-# ---------------------------------
 # Auth
 # ---------------------------------
 def can_edit() -> bool:
@@ -319,99 +193,136 @@ def can_edit() -> bool:
 def main():
     init_db()
     ensure_bbox_defaults()
-    sync_bbox_from_map_event()
 
-    st.title("Nesten Aziatische hoornaar – via GBIF")
-    st.caption("Toont waarnemingen (occurrences) van Vespa velutina en bewaart je eigen statussen/opmerkingen lokaal (SQLite).")
+    st.title("Nesten Aziatische hoornaar – Waarneming.nl")
+    st.caption("Scrapet waarneming.nl voor Vespa velutina-nesten en bewaart je eigen statussen/opmerkingen lokaal (SQLite).")
+
+    today = date.today()
+    default_date_to = today
+    default_date_from = max(today - timedelta(days=DEFAULT_HISTORY_DAYS), date(today.year, 1, 1))
 
     with st.sidebar:
         st.header("Filter")
-        country = st.selectbox("Land (GBIF country code)", ["NL", "BE", "DE", "FR", "None"], index=0)
-        country = None if country == "None" else country
+        location_query = st.text_input(
+            "Locatie (zoals in waarneming.nl zoekveld)",
+            value=DEFAULT_LOCATION_QUERY,
+            help="Bijvoorbeeld 's-Hertogenbosch of een gemeente/wijk."
+        ).strip()
+        if not location_query:
+            location_query = DEFAULT_LOCATION_QUERY
 
-        st.markdown("**Datumrange (eventDate)**")
+        activity_options = {
+            "Alle activiteiten": "",
+            "Alleen nesten (activity=NEST)": "NEST",
+        }
+        activity_label = st.selectbox("Activiteit (website filter)", list(activity_options.keys()), index=1)
+        activity_param = activity_options[activity_label]
+
+        st.markdown("**Datumrange**")
         apply_date_filter = st.checkbox("Filter op datumrange", value=False)
+        st.caption(
+            "Standaard worden waarnemingen uit de afgelopen drie maanden (binnen het huidige jaar) opgehaald."
+        )
         col_a, col_b = st.columns(2)
         with col_a:
-            date_from = st.date_input("Vanaf", value=None, disabled=not apply_date_filter)
+            date_from = st.date_input(
+                "Vanaf",
+                value=default_date_from,
+                disabled=not apply_date_filter
+            )
         with col_b:
-            date_to = st.date_input("Tot en met", value=None, disabled=not apply_date_filter)
+            date_to = st.date_input(
+                "Tot en met",
+                value=default_date_to,
+                disabled=not apply_date_filter
+            )
 
-        st.markdown("**Gebied (ENVELOPE bbox)**")
-        use_denbosch = st.checkbox(
-            "Gebruik preset ’s-Hertogenbosch",
-            value=st.session_state.get("use_denbosch", True),
-            key="use_denbosch",
+        st.markdown("**Gebied (kaart)**")
+        curr_min_lon, curr_min_lat, curr_max_lon, curr_max_lat = bbox_from_session()
+        st.caption(
+            "Kaart start in ’s-Hertogenbosch’. Versleep of zoom de kaart en klik onder de kaart op ‘Filters toepassen op kaart’ om het gebied bij te werken."
         )
-        if use_denbosch:
-            (
-                st.session_state["bbox_min_lon"],
-                st.session_state["bbox_min_lat"],
-                st.session_state["bbox_max_lon"],
-                st.session_state["bbox_max_lat"],
-            ) = DEN_BOSCH_BBOX
+        st.text(
+            f"minLon: {curr_min_lon:.4f}\nminLat: {curr_min_lat:.4f}\nmaxLon: {curr_max_lon:.4f}\nmaxLat: {curr_max_lat:.4f}"
+        )
+        reset_bbox = st.button("Reset naar preset ’s-Hertogenbosch’")
 
-        col_lon, col_lat = st.columns(2)
-        with col_lon:
-            st.number_input(
-                "minLon",
-                value=st.session_state["bbox_min_lon"],
-                key="bbox_min_lon",
-                format="%.6f",
-                disabled=use_denbosch,
-            )
-            st.number_input(
-                "maxLon",
-                value=st.session_state["bbox_max_lon"],
-                key="bbox_max_lon",
-                format="%.6f",
-                disabled=use_denbosch,
-            )
-        with col_lat:
-            st.number_input(
-                "minLat",
-                value=st.session_state["bbox_min_lat"],
-                key="bbox_min_lat",
-                format="%.6f",
-                disabled=use_denbosch,
-            )
-            st.number_input(
-                "maxLat",
-                value=st.session_state["bbox_max_lat"],
-                key="bbox_max_lat",
-                format="%.6f",
-                disabled=use_denbosch,
-            )
-
-        st.markdown("**Activiteit**")
-        only_nests = st.checkbox("Alleen nesten", value=False, help="Filtert waarnemingen waar Activity = 'nest' op Observation.org")
-
-        max_records = st.slider("Max records", 100, 5000, 1000, step=100)
+        max_records = st.slider("Max records", 50, 500, 200, step=50)
 
         st.markdown("---")
         st.caption("Klik ‘Verversen’ om filters toe te passen.")
         refresh = st.button("Verversen", type="primary")
+        force_refresh = st.button(
+            "Forceer verversen",
+            help="Leegt de cache en haalt de waarneming-data opnieuw op."
+        )
 
-    if st.session_state.pop("pending_refresh", False):
+    if force_refresh:
+        fetch_waarneming_occurrences.clear()
+        st.session_state.pop("df", None)
+        st.session_state.pop("last_params", None)
+        refresh = True
+        with st.sidebar:
+            st.success("Cache geleegd. Data wordt opnieuw opgehaald…")
+
+    if reset_bbox:
+        (
+            st.session_state["bbox_min_lon"],
+            st.session_state["bbox_min_lat"],
+            st.session_state["bbox_max_lon"],
+            st.session_state["bbox_max_lat"],
+        ) = DEN_BOSCH_BBOX
+        st.session_state.pop("df", None)
+        st.session_state.pop("last_params", None)
         refresh = True
 
-    date_from_value = date_from if apply_date_filter and isinstance(date_from, date) else None
-    date_to_value = date_to if apply_date_filter and isinstance(date_to, date) else None
+    date_from_value = (
+        date_from if apply_date_filter and isinstance(date_from, date) else default_date_from
+    )
+    date_to_value = (
+        date_to if apply_date_filter and isinstance(date_to, date) else default_date_to
+    )
     min_lon, min_lat, max_lon, max_lat = bbox_from_session()
 
     # Data ophalen
     if "df" not in st.session_state or refresh or "last_params" not in st.session_state:
-        df = fetch_gbif_occurrences(
-            taxon_key=VESPA_VELUTINA_TAXONKEY,
-            country=country,
-            geometry_envelope=(min_lon, min_lat, max_lon, max_lat),
-            date_from=date_from_value,
-            date_to=date_to_value,
-            max_records=max_records
-        )
+        try:
+            df = fetch_waarneming_occurrences(
+                species_id=WAARNEMING_SPECIES_ID,
+                location_query=location_query,
+                date_from=pd.Timestamp(date_from_value) if date_from_value else None,
+                date_to=pd.Timestamp(date_to_value) if date_to_value else None,
+                activity=activity_param or None,
+                max_records=max_records,
+            )
+        except WaarnemingScraperError as exc:
+            st.error(f"Kon waarnemingen niet ophalen: {exc}")
+            df = pd.DataFrame(columns=[
+                "id",
+                "lat",
+                "lon",
+                "date",
+                "location",
+                "reporter",
+                "activity",
+                "count",
+                "details",
+                "observation_url",
+            ])
+
+        if not df.empty:
+            df = df.dropna(subset=["lat", "lon"])
+            if min_lon <= max_lon:
+                lon_mask = df["lon"].between(min_lon, max_lon)
+            else:
+                lon_mask = (df["lon"] >= min_lon) | (df["lon"] <= max_lon)
+            lat_mask = df["lat"].between(min_lat, max_lat)
+            df = df[lon_mask & lat_mask].reset_index(drop=True)
+
         st.session_state["df"] = df
         st.session_state["last_params"] = (
-            country,
+            location_query,
+            activity_param,
             (min_lon, min_lat, max_lon, max_lat),
             date_from_value,
             date_to_value,
@@ -419,21 +330,9 @@ def main():
             apply_date_filter,
         )
     else:
-        df = st.session_state["df"]
+        df = st.session_state["df"].copy()
 
-    if only_nests:
-        base_df = st.session_state["df"]
-        needs_activity = "activity" not in base_df.columns or base_df["activity"].isna().any()
-        if needs_activity:
-            with st.spinner("Activiteiten ophalen voor nestfilter..."):
-                enriched = ensure_activity_column(base_df)
-            st.session_state["df"] = enriched
-        else:
-            enriched = base_df
-        df = enriched
-        df = df[df["activity"].fillna("").str.lower().str.contains("nest")].reset_index(drop=True)
-    else:
-        df = df.copy()
+    df = df.copy()
 
     # Merge met notities
     notes_df = fetch_notes()
@@ -442,21 +341,18 @@ def main():
 
     # Snel-filters (client side)
     left, right = st.columns([3,2])
+    map_df = None
     with left:
         st.subheader("Kaart")
         if merged.empty:
             st.info("Geen resultaten voor deze filters.")
         else:
-            # Kaartweergave (kleur op status)
-            show_df = merged.copy()
-            if "activity" not in show_df.columns:
-                show_df["activity"] = ""
-            show_df["date"] = show_df["date"].apply(
-                lambda val: val.isoformat() if isinstance(val, date) else ""
-            )
-            def status_display(row):
-                return row["status"] if pd.notna(row.get("status")) else "(leeg)"
-            show_df["status_display"] = show_df.apply(status_display, axis=1)
+            # Groepeer meldingen op identieke coördinaten zodat overlappende
+            # punten zichtbaar blijven en een teller krijgen.
+            map_source = merged.copy()
+            if "activity" not in map_source.columns:
+                map_source["activity"] = ""
+
             status_colors = {
                 "Verwijderd": [30, 150, 30],
                 "Onvindbaar": [200, 100, 0],
@@ -465,30 +361,104 @@ def main():
                 "(leeg)": [120, 120, 120],
             }
             default_color = status_colors["(leeg)"]
-            show_df["color"] = show_df["status_display"].map(status_colors).apply(
-                lambda value: value if isinstance(value, list) else default_color
+
+            def status_display(row: pd.Series) -> str:
+                return row["status"] if pd.notna(row.get("status")) else "(leeg)"
+
+            map_source["status_display"] = map_source.apply(status_display, axis=1)
+
+            def summarise_group(group: pd.DataFrame) -> pd.Series:
+                statuses = group["status_display"].dropna()
+                status = statuses.mode().iloc[0] if not statuses.empty else "(leeg)"
+                color = status_colors.get(status, default_color)
+
+                date_values = [d for d in group["date"] if isinstance(d, date)]
+                if date_values:
+                    start = min(date_values).isoformat()
+                    end = max(date_values).isoformat()
+                    date_range = start if start == end else f"{start} – {end}"
+                else:
+                    date_range = "-"
+
+                activities = sorted({a for a in group["activity"] if isinstance(a, str) and a})
+                activity_summary = ", ".join(activities) if activities else "-"
+
+                locations = group["location"].dropna()
+                location_summary = locations.mode().iloc[0] if not locations.empty else "-"
+
+                reporters = sorted({r for r in group["reporter"] if isinstance(r, str) and r})
+                reporter_summary = ", ".join(reporters[:3]) if reporters else "-"
+                if reporters and len(reporters) > 3:
+                    reporter_summary += " …"
+
+                ids = list(group["id"])
+                sample_ids = ", ".join(ids[:3]) if ids else "-"
+                if len(ids) > 3:
+                    sample_ids += f" … (+{len(ids) - 3})"
+
+                return pd.Series({
+                    "count": len(group),
+                    "status_display": status,
+                    "color": color,
+                    "date_range": date_range,
+                    "activity_summary": activity_summary,
+                    "location_summary": location_summary,
+                    "reporter_summary": reporter_summary,
+                    "sample_ids": sample_ids,
+                })
+
+            map_df = map_source.groupby(["lat", "lon"]).apply(summarise_group).reset_index()
+            map_df["radius"] = map_df["count"].apply(
+                lambda cnt: 35 + 18 * math.sqrt(max(cnt - 1, 0))
+            )
+            map_df["tooltip_html"] = map_df.apply(
+                lambda row: (
+                    f"<b>Aantal meldingen:</b> {row['count']}<br/>"
+                    f"<b>Meest voorkomende status:</b> {row['status_display']}<br/>"
+                    f"<b>Datumrange:</b> {row['date_range']}<br/>"
+                    f"<b>Activiteiten:</b> {row['activity_summary']}<br/>"
+                    f"<b>Locatie:</b> {row['location_summary']}<br/>"
+                    f"<b>Melder(s):</b> {row['reporter_summary']}<br/>"
+                    f"<b>Voorbeeld IDs:</b> {row['sample_ids']}"
+                ),
+                axis=1,
             )
 
             st.pydeck_chart(pdk.Deck(
                 map_style=None,
                 initial_view_state=pdk.ViewState(
-                    latitude=float(show_df["lat"].mean()),
-                    longitude=float(show_df["lon"].mean()),
+                    latitude=float(map_df["lat"].mean()),
+                    longitude=float(map_df["lon"].mean()),
                     zoom=11,
                     pitch=0
                 ),
                 layers=[
                     pdk.Layer(
                         "ScatterplotLayer",
-                        data=show_df,
+                        data=map_df,
                         get_position='[lon, lat]',
                         get_fill_color='color',
-                        get_radius=35,
+                        get_radius='radius',
                         pickable=True
                     )
                 ],
-                tooltip={"text": "ID: {id}\nDatum: {date}\nActiviteit: {activity}\nStatus: {status_display}\nLocatie: {location}"}
+                tooltip={"html": "{tooltip_html}", "style": {"color": "white"}}
             ), key=MAP_WIDGET_KEY)
+
+            st.caption(
+                f"Markers tonen {int(map_df['count'].sum())} meldingen samengevoegd tot "
+                f"{len(map_df)} unieke coördinaten. Straal schaalt mee met het aantal meldingen."
+            )
+
+            apply_map_filter = st.button("Filters toepassen op kaart", key="apply_map")
+            if apply_map_filter:
+                viewport = current_map_viewport()
+                if viewport and update_bbox_from_viewport(viewport):
+                    st.session_state.pop("df", None)
+                    st.session_state.pop("last_params", None)
+                    st.rerun()
+                else:
+                    st.info("Geen wijziging in kaartuitsnede gedetecteerd.")
     with right:
         st.subheader("Telling")
         total = len(merged)
@@ -497,6 +467,8 @@ def main():
         st.metric("Totaal", total)
         st.metric("Open", int(open_count))
         st.metric("Verwijderd", int(removed_count))
+        unique_locations = len(map_df) if map_df is not None else 0
+        st.metric("Unieke locaties op kaart", unique_locations)
 
     st.subheader("Meldingen")
     # Client-side tekstfilter
@@ -516,6 +488,7 @@ def main():
             "id",
             "date",
             "activity",
+            "details",
             "status",
             "reporter",
             "location",
@@ -523,6 +496,7 @@ def main():
             "lon",
             "basisOfRecord",
             "countryCode",
+            "observation_url",
         ]
         if c in list_df.columns
     ]
@@ -535,7 +509,7 @@ def main():
             st.info("Geen meldingen om te bewerken met de huidige filter.")
         else:
             ids = list_df["id"].tolist()
-            selected_id = st.selectbox("Kies melding (GBIF occurrence key)", options=ids)
+            selected_id = st.selectbox("Kies melding (waarneming-id)", options=ids)
             row = merged[merged["id"] == selected_id].iloc[0]
 
             st.write(
