@@ -1,6 +1,5 @@
-streamlit
+streamlit==1.50.0
 pandas
 requests
 pydeck
 beautifulsoup4
-

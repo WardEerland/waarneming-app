@@ -258,23 +258,9 @@ def delete_cached_scrape(cache_key: str) -> None:
 # ---------------------------------
 # Auth
 # ---------------------------------
-def can_edit() -> bool:
-    if not ADMIN_PASSWORD:
-        return True
-    if "is_admin" not in st.session_state:
-        st.session_state["is_admin"] = False
-    if st.session_state["is_admin"]:
-        return True
-    with st.sidebar:
-        st.subheader("Beheer")
-        pwd = st.text_input("Admin-wachtwoord", type="password")
-        if st.button("Inloggen"):
-            if pwd == ADMIN_PASSWORD:
-                st.session_state["is_admin"] = True
-                st.success("Ingelogd als beheerder.")
-            else:
-                st.error("Onjuist wachtwoord.")
-    return st.session_state["is_admin"]
+def can_edit(container=None) -> bool:
+    _ = container
+    return True
 
 # ---------------------------------
 # UI
@@ -291,6 +277,7 @@ def main():
     default_date_to = today
     default_date_from = max(today - timedelta(days=DEFAULT_HISTORY_DAYS), date(today.year, 1, 1))
 
+    admin_allowed = can_edit()
     with st.sidebar:
         st.header("Filter")
         location_query = st.text_input(
@@ -443,11 +430,31 @@ def main():
             st.session_state["fetch_source"] = "cache"
 
     df = df.copy()
+    if "id" in df.columns:
+        sort_cols = ["id"]
+        if "date" in df.columns:
+            sort_cols.append("date")
+        df = (
+            df.sort_values(by=sort_cols, ascending=[True] * len(sort_cols), na_position="last")
+            .drop_duplicates(subset="id", keep="last")
+            .reset_index(drop=True)
+        )
 
     # Merge met notities
     notes_df = fetch_notes()
     notes_df.rename(columns={"observation_id": "id"}, inplace=True)
     merged = df.merge(notes_df, on="id", how="left")
+    if "id" in merged.columns:
+        merge_sort_cols = ["id"]
+        if "updated_at" in merged.columns:
+            merge_sort_cols.append("updated_at")
+        elif "date" in merged.columns:
+            merge_sort_cols.append("date")
+        merged = (
+            merged.sort_values(by=merge_sort_cols, ascending=[True] * len(merge_sort_cols), na_position="last")
+            .drop_duplicates(subset="id", keep="last")
+            .reset_index(drop=True)
+        )
 
     fetch_source = st.session_state.get("fetch_source")
     if fetch_source == "cache":
@@ -467,17 +474,29 @@ def main():
             if "activity" not in map_df.columns:
                 map_df["activity"] = ""
 
+            if "id" in map_df.columns:
+                sort_cols = ["id"]
+                if "updated_at" in map_df.columns:
+                    sort_cols.append("updated_at")
+                map_df = (
+                    map_df.sort_values(by=sort_cols, ascending=[True] * len(sort_cols), na_position="last")
+                    .drop_duplicates(subset="id", keep="last")
+                    .reset_index(drop=True)
+                )
+
             status_colors = {
+                "Open": [200, 30, 30],
                 "Verwijderd": [30, 150, 30],
                 "Onvindbaar": [200, 100, 0],
                 "Anders": [100, 100, 200],
-                "Open": [200, 30, 30],
-                "(leeg)": [120, 120, 120],
             }
-            default_color = status_colors["(leeg)"]
+            default_color = status_colors["Open"]
 
             def status_display(row: pd.Series) -> str:
-                return row["status"] if pd.notna(row.get("status")) else "(leeg)"
+                status_val = row.get("status")
+                if isinstance(status_val, str) and status_val.strip():
+                    return status_val
+                return "Open"
 
             map_df["status_display"] = map_df.apply(status_display, axis=1)
             map_df["color"] = map_df["status_display"].map(status_colors).apply(
@@ -540,15 +559,23 @@ def main():
             map_event = st.pydeck_chart(
                 deck,
                 key=MAP_WIDGET_KEY,
-                selection_mode="single-select",
+                selection_mode="single-object",
                 on_select="rerun",
-                on_click="rerun",
             )
 
             st.caption("Elke marker toont één waarneming met de exacte coördinaten uit waarneming.nl.")
-
-            with st.expander("Kaart-debug (tijdelijk)"):
-                st.json(st.session_state.get(MAP_WIDGET_KEY, {}))
+            legend_html_parts = []
+            for label, rgb in status_colors.items():
+                hex_color = "#{:02x}{:02x}{:02x}".format(*rgb)
+                legend_html_parts.append(
+                    f"<span style='display:inline-flex;align-items:center;margin-right:1rem;'>"
+                    f"<span style='width:12px;height:12px;border-radius:50%;background:{hex_color};display:inline-block;margin-right:0.3rem;'></span>"
+                    f"{label}</span>"
+                )
+            st.markdown(
+                f"<div style='margin-top:0.5rem;'>{''.join(legend_html_parts)}</div>",
+                unsafe_allow_html=True,
+            )
 
             def extract_id_from_payload(payload) -> Optional[str]:
                 if not isinstance(payload, dict):
@@ -568,6 +595,23 @@ def main():
                     return str(map_plot_df.iloc[point_index]["id"])
                 return None
 
+            def find_first_id(payload) -> Optional[str]:
+                stack: List = [payload]  # type: ignore[var-annotated]
+                while stack:
+                    current = stack.pop()
+                    if isinstance(current, dict):
+                        candidate = extract_id_from_payload(current)
+                        if candidate:
+                            return candidate
+                        for value in current.values():
+                            if isinstance(value, (dict, list)):
+                                stack.append(value)
+                    elif isinstance(current, list):
+                        for item in current:
+                            if isinstance(item, (dict, list)):
+                                stack.append(item)
+                return None
+
             selection_from_event = False
             map_state = st.session_state.get(MAP_WIDGET_KEY)
             picked_id = None
@@ -575,25 +619,18 @@ def main():
             if map_event is not None:
                 event_selections = getattr(map_event, "selection", None)
                 event_selections = getattr(event_selections, "value", event_selections)
-                if isinstance(event_selections, dict):
-                    event_selections = [event_selections]
-                if isinstance(event_selections, list):
-                    for payload in event_selections:
-                        picked_id = extract_id_from_payload(payload)
-                        if picked_id:
-                            selection_from_event = True
-                            break
+                if event_selections is not None:
+                    picked_id = find_first_id(event_selections)
+                    if picked_id:
+                        selection_from_event = True
+
                 if not picked_id:
                     event_click = getattr(map_event, "click_info", None)
                     event_click = getattr(event_click, "value", event_click)
-                    if isinstance(event_click, dict):
-                        event_click = [event_click]
-                    if isinstance(event_click, list):
-                        for payload in event_click:
-                            picked_id = extract_id_from_payload(payload)
-                            if picked_id:
-                                selection_from_event = True
-                                break
+                    if event_click is not None:
+                        picked_id = find_first_id(event_click)
+                        if picked_id:
+                            selection_from_event = True
 
             # editor selection fallback per marker index (pydeck's click_info feature)
             if isinstance(map_state, dict):
@@ -637,34 +674,26 @@ def main():
                 if not selection_from_event:
                     st.rerun()
 
-            apply_map_filter = st.button("Filters toepassen op kaart", key="apply_map")
-            if apply_map_filter:
-                viewport = current_map_viewport()
-                if viewport and update_bbox_from_viewport(viewport):
-                    st.session_state.pop("df", None)
-                    st.session_state.pop("last_params", None)
-                    st.rerun()
-                else:
-                    st.info("Geen wijziging in kaartuitsnede gedetecteerd.")
     with right:
         st.subheader("Telling")
         total = len(merged)
-        open_count = (merged["status"] == "Open").sum() if "status" in merged.columns else 0
-        removed_count = (merged["status"] == "Verwijderd").sum() if "status" in merged.columns else 0
+        status_series = merged["status"] if "status" in merged.columns else pd.Series(dtype="object")
+        if not status_series.empty:
+            status_filled = status_series.fillna("Open").replace("", "Open")
+            open_count = status_filled.eq("Open").sum()
+            removed_count = status_series.eq("Verwijderd").sum()
+        else:
+            open_count = 0
+            removed_count = 0
         st.metric("Totaal", total)
         st.metric("Open", int(open_count))
         st.metric("Verwijderd", int(removed_count))
-        if map_df is not None:
-            unique_locations = map_df[["lat", "lon"]].dropna().drop_duplicates().shape[0]
-        else:
-            unique_locations = 0
-        st.metric("Unieke locaties op kaart", unique_locations)
 
     list_df = merged.copy()
 
     st.divider()
     st.subheader("Bewerken")
-    if can_edit():
+    if admin_allowed:
         if list_df.empty:
             st.info("Geen meldingen om te bewerken met de huidige filter.")
             selected_id = None
@@ -706,7 +735,8 @@ def main():
                     count_str = "-"
                 detail_str = row.get("details") or "-"
                 observation_url = row.get("observation_url")
-                status_label = row.get("status") if pd.notna(row.get("status")) else "(leeg)"
+                status_val = row.get("status")
+                status_label = status_val if pd.notna(status_val) and str(status_val).strip() else "Open"
 
                 st.markdown(
                     "\n".join([
@@ -721,9 +751,7 @@ def main():
                     st.markdown(f"[Open waarneming in browser]({observation_url})")
 
                 status_options = ["Open", "Verwijderd", "Onvindbaar", "Anders"]
-                initial_status = row.get("status") if pd.notna(row.get("status")) else "Open"
-                if initial_status not in status_options:
-                    initial_status = "Open"
+                initial_status = status_label if status_label in status_options else "Open"
                 initial_comment = row.get("comment") if pd.notna(row.get("comment")) else ""
 
                 if st.session_state.get("edit_selected_id") != selected_id:
