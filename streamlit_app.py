@@ -259,8 +259,28 @@ def delete_cached_scrape(cache_key: str) -> None:
 # Auth
 # ---------------------------------
 def can_edit(container=None) -> bool:
-    _ = container
-    return True
+    target = container or st.sidebar
+
+    if not ADMIN_PASSWORD:
+        return True
+
+    if "is_admin" not in st.session_state:
+        st.session_state["is_admin"] = False
+
+    if st.session_state["is_admin"]:
+        with target:
+            st.caption("Ingelogd als beheerder.")
+        return True
+
+    with target:
+        pwd = st.text_input("Admin-wachtwoord", type="password", key="admin_password_input")
+        if st.button("Inloggen", key="admin_login_button"):
+            if pwd == ADMIN_PASSWORD:
+                st.session_state["is_admin"] = True
+                st.success("Ingelogd als beheerder.")
+            else:
+                st.error("Onjuist wachtwoord.")
+    return st.session_state["is_admin"]
 
 # ---------------------------------
 # UI
@@ -277,8 +297,11 @@ def main():
     default_date_to = today
     default_date_from = max(today - timedelta(days=DEFAULT_HISTORY_DAYS), date(today.year, 1, 1))
 
-    admin_allowed = can_edit()
+    admin_allowed = False
     with st.sidebar:
+        st.header("Beheer")
+        admin_allowed = can_edit(container=st.sidebar)
+        st.markdown("---")
         st.header("Filter")
         location_query = st.text_input(
             "Locatie (zoals in waarneming.nl zoekveld)",
