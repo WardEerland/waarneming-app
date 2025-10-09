@@ -26,8 +26,8 @@ DEFAULT_LOCATION_QUERY = "s-Hertogenbosch"
 DEFAULT_HISTORY_DAYS = 90
 SCRAPE_CACHE_TTL_HOURS = 6
 
-# ’s-Hertogenbosch benaderende bbox (ruim genomen) -> minLon, minLat, maxLon, maxLat
-DEN_BOSCH_BBOX = (5.215, 51.63, 5.40, 51.76)
+# ’s-Hertogenbosch (incl. Empel & Rosmalen) -> minLon, minLat, maxLon, maxLat
+DEN_BOSCH_BBOX = (5.17, 51.60, 5.50, 51.82)
 MAP_WIDGET_KEY = "occurrence_map"
 FOCUS_LOCK_PATCH_KEY = "_focus_lock_patch_applied"
 

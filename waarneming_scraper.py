@@ -16,6 +16,9 @@ BASE_DOMAIN = "https://waarneming.nl"
 DEFAULT_USER_AGENT = "waarneming-app/1.0 (+https://example.com/contact)"
 REQUEST_TIMEOUT = 20  # seconds
 REQUEST_DELAY = 0.1  # seconds between detail fetches
+LOCATION_ALIASES: Dict[str, List[str]] = {
+    "s-hertogenbosch": ["s-Hertogenbosch", "Rosmalen", "Empel"],
+}
 
 EXPECTED_COLUMNS = [
     "id",
@@ -38,7 +41,7 @@ class WaarnemingScraperError(RuntimeError):
 @dataclass
 class _ScrapeConfig:
     species_id: int
-    location_query: str
+    location_query: Optional[str]
     date_from: Optional[pd.Timestamp]
     date_to: Optional[pd.Timestamp]
     activity: Optional[str]
@@ -155,6 +158,28 @@ def _fetch_coordinates(session: requests.Session, observation_id: str, cache: Di
     return cache[observation_id]
 
 
+def _resolve_location_queries(location_query: Optional[str]) -> List[Optional[str]]:
+    if location_query is None:
+        return [None]
+
+    raw = location_query.strip()
+    if not raw:
+        return [None]
+
+    lower_key = raw.lower()
+    if lower_key in LOCATION_ALIASES:
+        aliases = LOCATION_ALIASES[lower_key]
+        return list(dict.fromkeys(alias.strip() for alias in aliases if alias.strip()))
+
+    if "," in raw:
+        parts = [part.strip() for part in raw.split(",")]
+        filtered = [part for part in parts if part]
+        if filtered:
+            return list(dict.fromkeys(filtered))
+
+    return [raw]
+
+
 def _scrape(cfg: _ScrapeConfig, user_agent: str) -> pd.DataFrame:
     session = requests.Session()
     session.headers.update({"User-Agent": user_agent or DEFAULT_USER_AGENT})
@@ -249,13 +274,33 @@ def fetch_waarneming_occurrences(
     """Scrape waarneming.nl en retourneer een DataFrame met observaties."""
 
     max_pages = max(1, math.ceil(max_records / 25))
-    cfg = _ScrapeConfig(
-        species_id=species_id,
-        location_query=location_query,
-        date_from=date_from,
-        date_to=date_to,
-        activity=activity,
-        max_records=max_records,
-        max_pages=max_pages,
-    )
-    return _scrape(cfg, user_agent)
+    location_queries = _resolve_location_queries(location_query)
+    collected_frames: List[pd.DataFrame] = []
+    fetched = 0
+
+    for loc_query in location_queries:
+        remaining = max_records - fetched
+        if remaining <= 0:
+            break
+
+        cfg = _ScrapeConfig(
+            species_id=species_id,
+            location_query=loc_query,
+            date_from=date_from,
+            date_to=date_to,
+            activity=activity,
+            max_records=remaining,
+            max_pages=max_pages,
+        )
+        df_part = _scrape(cfg, user_agent)
+        if not df_part.empty:
+            collected_frames.append(df_part)
+            fetched += len(df_part)
+
+    if not collected_frames:
+        return pd.DataFrame(columns=EXPECTED_COLUMNS)
+
+    combined = pd.concat(collected_frames, ignore_index=True)
+    combined = combined.drop_duplicates(subset="id", keep="first")
+    combined = combined.reindex(columns=EXPECTED_COLUMNS)
+    return combined
