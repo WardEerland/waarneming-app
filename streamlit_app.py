@@ -223,7 +223,7 @@ def main():
                     st.session_state["location_queries"].append(candidate)
                     added_any = True
             if added_any:
-                st.session_state["location_active_choices"] = list(st.session_state["location_queries"])
+                st.session_state["location_active_choices_refresh"] = True
                 st.session_state["trigger_refresh"] = True
                 st.session_state.pop("df", None)
                 st.session_state.pop("last_params", None)
@@ -231,7 +231,9 @@ def main():
 
         st.button("Voeg locatie toe", key="location_add_button", on_click=_handle_add_location)
 
-        if "location_active_choices" not in st.session_state:
+        if st.session_state.pop("location_active_choices_refresh", False):
+            st.session_state["location_active_choices"] = list(st.session_state["location_queries"])
+        elif "location_active_choices" not in st.session_state:
             st.session_state["location_active_choices"] = list(st.session_state["location_queries"])
 
         selected_locations = st.multiselect(
@@ -242,7 +244,7 @@ def main():
         )
         if selected_locations != st.session_state["location_queries"]:
             st.session_state["location_queries"] = selected_locations or [DEFAULT_LOCATION_QUERY]
-            st.session_state["location_active_choices"] = list(st.session_state["location_queries"])
+            st.session_state["location_active_choices_refresh"] = True
             st.session_state["trigger_refresh"] = True
             st.session_state.pop("df", None)
             st.session_state.pop("last_params", None)
@@ -250,7 +252,7 @@ def main():
         reset_locations = st.button("Reset locaties", key="reset_location_button")
         if reset_locations:
             st.session_state["location_queries"] = [DEFAULT_LOCATION_QUERY]
-            st.session_state["location_active_choices"] = list(st.session_state["location_queries"])
+            st.session_state["location_active_choices_refresh"] = True
             st.session_state["trigger_refresh"] = True
             st.session_state.pop("df", None)
             st.session_state.pop("last_params", None)
