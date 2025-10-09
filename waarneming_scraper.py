@@ -40,6 +40,8 @@ class WaarnemingScraperError(RuntimeError):
 
 @dataclass
 class _ScrapeConfig:
+    """Configuratiecontainer voor een enkele scrape-run."""
+
     species_id: int
     location_query: Optional[str]
     date_from: Optional[pd.Timestamp]
@@ -50,6 +52,8 @@ class _ScrapeConfig:
 
 
 def _build_search_params(cfg: _ScrapeConfig, page: int) -> Dict[str, str]:
+    """Stel de queryparameters samen voor de soortpagina."""
+
     params: Dict[str, str] = {
         "advanced": "on",
         "search": "",
@@ -75,6 +79,8 @@ def _build_search_params(cfg: _ScrapeConfig, page: int) -> Dict[str, str]:
 
 
 def _extract_observation_id(href: str) -> Optional[str]:
+    """Extraheer het observatie-ID uit een relatieve waarneming.nl URL."""
+
     if not href:
         return None
     parts = href.strip("/").split("/")
@@ -86,10 +92,14 @@ def _extract_observation_id(href: str) -> Optional[str]:
 
 
 def _clean_cell_text(cell) -> str:
+    """Haal leesbare tekst uit een tabelcel en trim whitespace."""
+
     return cell.get_text(" ", strip=True) if cell else ""
 
 
 def _parse_count(details: str) -> Optional[int]:
+    """Probeer een telwaarde uit het detailsveld te halen."""
+
     for token in details.split():
         if token.isdigit():
             try:
@@ -100,6 +110,8 @@ def _parse_count(details: str) -> Optional[int]:
 
 
 def _parse_activity(details: str) -> str:
+    """Normaliseer het activiteitlabel dat in de details genoemd wordt."""
+
     text = details.lower()
     if "nest" in text:
         # Normalise naar een korte label
@@ -108,6 +120,8 @@ def _parse_activity(details: str) -> str:
 
 
 def _parse_date(value: str) -> Optional[pd.Timestamp]:
+    """Zet een datumsnaar uit de tabel om naar een pandas Timestamp."""
+
     if not value:
         return None
     try:
@@ -120,6 +134,8 @@ def _parse_date(value: str) -> Optional[pd.Timestamp]:
 
 
 def _fetch_coordinates(session: requests.Session, observation_id: str, cache: Dict[str, Tuple[Optional[float], Optional[float]]]) -> Tuple[Optional[float], Optional[float]]:
+    """Vraag de geojson-detailpagina op en haal lat/lon op met caching."""
+
     if observation_id in cache:
         return cache[observation_id]
 
@@ -159,6 +175,8 @@ def _fetch_coordinates(session: requests.Session, observation_id: str, cache: Di
 
 
 def _resolve_location_queries(location_query: Optional[str]) -> List[Optional[str]]:
+    """Zet een gebruikersinvoer om naar een lijst losse locatiequeries."""
+
     if location_query is None:
         return [None]
 
@@ -171,16 +189,27 @@ def _resolve_location_queries(location_query: Optional[str]) -> List[Optional[st
         aliases = LOCATION_ALIASES[lower_key]
         return list(dict.fromkeys(alias.strip() for alias in aliases if alias.strip()))
 
-    if "," in raw:
-        parts = [part.strip() for part in raw.split(",")]
-        filtered = [part for part in parts if part]
-        if filtered:
-            return list(dict.fromkeys(filtered))
+    normalized = raw.replace("\n", ",")
+    if "," in normalized:
+        parts = [part.strip() for part in normalized.split(",")]
+        expanded: List[str] = []
+        for part in parts:
+            if not part:
+                continue
+            alias_key = part.lower()
+            if alias_key in LOCATION_ALIASES:
+                expanded.extend(LOCATION_ALIASES[alias_key])
+            else:
+                expanded.append(part)
+        if expanded:
+            return list(dict.fromkeys(expanded))
 
     return [raw]
 
 
 def _scrape(cfg: _ScrapeConfig, user_agent: str) -> pd.DataFrame:
+    """Voer de daadwerkelijke scrape uit voor één locatiequery."""
+
     session = requests.Session()
     session.headers.update({"User-Agent": user_agent or DEFAULT_USER_AGENT})
 
@@ -276,31 +305,26 @@ def fetch_waarneming_occurrences(
     max_pages = max(1, math.ceil(max_records / 25))
     location_queries = _resolve_location_queries(location_query)
     collected_frames: List[pd.DataFrame] = []
-    fetched = 0
 
     for loc_query in location_queries:
-        remaining = max_records - fetched
-        if remaining <= 0:
-            break
-
         cfg = _ScrapeConfig(
             species_id=species_id,
             location_query=loc_query,
             date_from=date_from,
             date_to=date_to,
             activity=activity,
-            max_records=remaining,
+            max_records=max_records,
             max_pages=max_pages,
         )
         df_part = _scrape(cfg, user_agent)
         if not df_part.empty:
             collected_frames.append(df_part)
-            fetched += len(df_part)
 
     if not collected_frames:
         return pd.DataFrame(columns=EXPECTED_COLUMNS)
 
     combined = pd.concat(collected_frames, ignore_index=True)
     combined = combined.drop_duplicates(subset="id", keep="first")
+    combined = combined.head(max_records)
     combined = combined.reindex(columns=EXPECTED_COLUMNS)
     return combined

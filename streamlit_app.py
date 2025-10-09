@@ -1,9 +1,8 @@
 import json
 import time
 import sqlite3
-import math
 from datetime import datetime, date, timedelta
-from typing import Optional, Tuple, List
+from typing import Optional, List
 
 import pandas as pd
 import streamlit as st
@@ -26,8 +25,6 @@ DEFAULT_LOCATION_QUERY = "s-Hertogenbosch"
 DEFAULT_HISTORY_DAYS = 90
 SCRAPE_CACHE_TTL_HOURS = 6
 
-# ’s-Hertogenbosch (incl. Empel & Rosmalen) -> minLon, minLat, maxLon, maxLat
-DEN_BOSCH_BBOX = (5.17, 51.60, 5.50, 51.82)
 MAP_WIDGET_KEY = "occurrence_map"
 FOCUS_LOCK_PATCH_KEY = "_focus_lock_patch_applied"
 
@@ -46,105 +43,6 @@ def disable_focus_lock_trap():
         """,
         unsafe_allow_html=True,
     )
-
-
-def ensure_bbox_defaults():
-    if "bbox_min_lon" not in st.session_state:
-        st.session_state["bbox_min_lon"] = DEN_BOSCH_BBOX[0]
-    if "bbox_min_lat" not in st.session_state:
-        st.session_state["bbox_min_lat"] = DEN_BOSCH_BBOX[1]
-    if "bbox_max_lon" not in st.session_state:
-        st.session_state["bbox_max_lon"] = DEN_BOSCH_BBOX[2]
-    if "bbox_max_lat" not in st.session_state:
-        st.session_state["bbox_max_lat"] = DEN_BOSCH_BBOX[3]
-
-
-def bbox_from_session() -> Tuple[float, float, float, float]:
-    return (
-        float(st.session_state["bbox_min_lon"]),
-        float(st.session_state["bbox_min_lat"]),
-        float(st.session_state["bbox_max_lon"]),
-        float(st.session_state["bbox_max_lat"]),
-    )
-
-
-def viewport_to_bbox(viewport: Optional[dict]) -> Optional[Tuple[float, float, float, float]]:
-    if not viewport or not isinstance(viewport, dict):
-        return None
-
-    try:
-        lon = float(viewport["longitude"])
-        lat = float(viewport["latitude"])
-    except (KeyError, TypeError, ValueError):
-        return None
-
-    zoom = float(viewport.get("zoom", 10.0))
-    width = float(viewport.get("width") or viewport.get("viewport_width") or 900)
-    height = float(viewport.get("height") or viewport.get("viewport_height") or 600)
-
-    lat_rad = math.radians(lat)
-    # Avoid divide-by-zero near the poles
-    cos_lat = max(math.cos(lat_rad), 1e-6)
-
-    meters_per_pixel = 156543.03392 * cos_lat / (2 ** zoom)
-    half_width_m = meters_per_pixel * width / 2
-    half_height_m = meters_per_pixel * height / 2
-
-    earth_radius = 6_378_137.0  # meters
-    lat_delta = (half_height_m / earth_radius) * (180 / math.pi)
-    lon_delta = (half_width_m / (earth_radius * cos_lat)) * (180 / math.pi)
-
-    min_lat = max(-90.0, lat - lat_delta)
-    max_lat = min(90.0, lat + lat_delta)
-    min_lon = lon - lon_delta
-    max_lon = lon + lon_delta
-
-    if min_lon < -180.0:
-        min_lon += 360.0
-    if max_lon > 180.0:
-        max_lon -= 360.0
-
-    return (
-        round(min_lon, 6),
-        round(min_lat, 6),
-        round(max_lon, 6),
-        round(max_lat, 6),
-    )
-
-
-def update_bbox_from_viewport(viewport: Optional[dict]) -> bool:
-    bbox = viewport_to_bbox(viewport)
-    if not bbox:
-        return False
-
-    current_bbox = bbox_from_session()
-    if all(math.isclose(a, b, abs_tol=1e-6) for a, b in zip(bbox, current_bbox)):
-        return False
-
-    (
-        st.session_state["bbox_min_lon"],
-        st.session_state["bbox_min_lat"],
-        st.session_state["bbox_max_lon"],
-        st.session_state["bbox_max_lat"],
-    ) = bbox
-    return True
-
-
-def current_map_viewport() -> Optional[dict]:
-    state = st.session_state.get(MAP_WIDGET_KEY)
-    if not isinstance(state, dict):
-        return None
-
-    for key in ("viewport", "view_state", "last_view_state"):
-        candidate = state.get(key)
-        if isinstance(candidate, dict):
-            return candidate
-
-    # Fallback: some Streamlit versions store the values directly on the dict.
-    if {"latitude", "longitude"}.issubset(state.keys()):
-        return state
-
-    return None
 
 # ---------------------------------
 # DB helpers
@@ -287,7 +185,6 @@ def can_edit(container=None) -> bool:
 # ---------------------------------
 def main():
     init_db()
-    ensure_bbox_defaults()
     disable_focus_lock_trap()
 
     st.title("Nesten Aziatische hoornaar – Waarneming.nl")
@@ -296,20 +193,69 @@ def main():
     today = date.today()
     default_date_to = today
     default_date_from = max(today - timedelta(days=DEFAULT_HISTORY_DAYS), date(today.year, 1, 1))
+    if "location_queries" not in st.session_state or not st.session_state["location_queries"]:
+        st.session_state["location_queries"] = [DEFAULT_LOCATION_QUERY]
 
     admin_allowed = False
+    refresh = False
+    refresh_button_clicked = False
     with st.sidebar:
         st.header("Beheer")
         admin_allowed = can_edit(container=st.sidebar)
         st.markdown("---")
         st.header("Filter")
-        location_query = st.text_input(
-            "Locatie (zoals in waarneming.nl zoekveld)",
-            value=DEFAULT_LOCATION_QUERY,
-            help="Bijvoorbeeld 's-Hertogenbosch of een gemeente/wijk."
-        ).strip()
-        if not location_query:
-            location_query = DEFAULT_LOCATION_QUERY
+        st.text_input(
+            "Locatie toevoegen",
+            key="location_add_input",
+            help="Voeg één of meerdere locaties toe (scheid met komma of nieuwe regel)."
+        )
+
+        def _handle_add_location() -> None:
+            raw_value = st.session_state.get("location_add_input", "")
+            candidates = [
+                part.strip()
+                for part in raw_value.replace("\n", ",").split(",")
+                if part.strip()
+            ]
+            added_any = False
+            for candidate in candidates:
+                if candidate not in st.session_state["location_queries"]:
+                    st.session_state["location_queries"].append(candidate)
+                    added_any = True
+            if added_any:
+                st.session_state["location_active_choices"] = list(st.session_state["location_queries"])
+                st.session_state["trigger_refresh"] = True
+                st.session_state.pop("df", None)
+                st.session_state.pop("last_params", None)
+            st.session_state["location_add_input"] = ""
+
+        st.button("Voeg locatie toe", key="location_add_button", on_click=_handle_add_location)
+
+        if "location_active_choices" not in st.session_state:
+            st.session_state["location_active_choices"] = list(st.session_state["location_queries"])
+
+        selected_locations = st.multiselect(
+            "Actieve locaties",
+            options=st.session_state["location_queries"],
+            key="location_active_choices",
+            help="Vink locaties uit om ze te verwijderen. Gebruik 'Voeg locatie toe' om locaties op te slaan."
+        )
+        if selected_locations != st.session_state["location_queries"]:
+            st.session_state["location_queries"] = selected_locations or [DEFAULT_LOCATION_QUERY]
+            st.session_state["location_active_choices"] = list(st.session_state["location_queries"])
+            st.session_state["trigger_refresh"] = True
+            st.session_state.pop("df", None)
+            st.session_state.pop("last_params", None)
+
+        reset_locations = st.button("Reset locaties", key="reset_location_button")
+        if reset_locations:
+            st.session_state["location_queries"] = [DEFAULT_LOCATION_QUERY]
+            st.session_state["location_active_choices"] = list(st.session_state["location_queries"])
+            st.session_state["trigger_refresh"] = True
+            st.session_state.pop("df", None)
+            st.session_state.pop("last_params", None)
+
+        location_query = ", ".join(st.session_state["location_queries"])
 
         activity_options = {
             "Alle activiteiten": "",
@@ -337,36 +283,17 @@ def main():
                 disabled=not apply_date_filter
             )
 
-        st.markdown("**Gebied (kaart)**")
-        curr_min_lon, curr_min_lat, curr_max_lon, curr_max_lat = bbox_from_session()
-        st.caption(
-            "Kaart start in ’s-Hertogenbosch’. Versleep of zoom de kaart en klik onder de kaart op ‘Filters toepassen op kaart’ om het gebied bij te werken."
-        )
-        st.text(
-            f"minLon: {curr_min_lon:.4f}\nminLat: {curr_min_lat:.4f}\nmaxLon: {curr_max_lon:.4f}\nmaxLat: {curr_max_lat:.4f}"
-        )
-        reset_bbox = st.button("Reset naar preset ’s-Hertogenbosch’")
-
         max_records = st.slider("Max records", 50, 500, 200, step=50)
 
         st.markdown("---")
         st.caption("Klik ‘Verversen’ om filters toe te passen.")
-        refresh = st.button("Verversen", type="primary")
-        force_refresh = st.button(
-            "Forceer verversen",
+        refresh_trigger = st.session_state.pop("trigger_refresh", False)
+        refresh_button_clicked = st.button(
+            "Verversen",
+            type="primary",
             help="Leegt de cache en haalt de waarneming-data opnieuw op."
         )
-
-    if reset_bbox:
-        (
-            st.session_state["bbox_min_lon"],
-            st.session_state["bbox_min_lat"],
-            st.session_state["bbox_max_lon"],
-            st.session_state["bbox_max_lat"],
-        ) = DEN_BOSCH_BBOX
-        st.session_state.pop("df", None)
-        st.session_state.pop("last_params", None)
-        refresh = True
+        refresh = refresh_trigger or refresh_button_clicked
 
     date_from_value = (
         date_from if apply_date_filter and isinstance(date_from, date) else default_date_from
@@ -374,7 +301,6 @@ def main():
     date_to_value = (
         date_to if apply_date_filter and isinstance(date_to, date) else default_date_to
     )
-    min_lon, min_lat, max_lon, max_lat = bbox_from_session()
 
     cache_key = "|".join([
         location_query or "",
@@ -384,7 +310,7 @@ def main():
         str(max_records),
     ])
 
-    if force_refresh:
+    if refresh_button_clicked:
         fetch_waarneming_occurrences.clear()
         delete_cached_scrape(cache_key)
         st.session_state.pop("df", None)
@@ -426,19 +352,12 @@ def main():
 
         df = raw_df.copy()
         if not df.empty:
-            df = df.dropna(subset=["lat", "lon"])
-            if min_lon <= max_lon:
-                lon_mask = df["lon"].between(min_lon, max_lon)
-            else:
-                lon_mask = (df["lon"] >= min_lon) | (df["lon"] <= max_lon)
-            lat_mask = df["lat"].between(min_lat, max_lat)
-            df = df[lon_mask & lat_mask].reset_index(drop=True)
+            df = df.dropna(subset=["lat", "lon"]).reset_index(drop=True)
 
         st.session_state["df"] = df
         st.session_state["last_params"] = (
             location_query,
             activity_param,
-            (min_lon, min_lat, max_lon, max_lat),
             date_from_value,
             date_to_value,
             max_records,

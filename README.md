@@ -1,36 +1,33 @@
-# 🎈 Blank app template
+# Waarneming-app voor Vespa velutina
 
-A simple Streamlit app template for you to modify!
+Streamlit-dashboard dat nesten van de Aziatische hoornaar van [waarneming.nl](https://waarneming.nl) ophaalt, combineert met lokale notities en toont op een kaart.
 
-[![Open in Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://blank-app-template.streamlit.app/)
+## Installatie
 
-### Installing dependencies
+Installeer alle vereiste Python-pakketten (Streamlit, pandas, requests, pydeck, BeautifulSoup):
 
-Install the Python packages listed in `requirements.txt` — including `requests`, which the GBIF helper uses for HTTP calls:
-
-```
+```bash
 pip install -r requirements.txt
 ```
 
-### Using the GBIF helper module
+## Applicatie starten
 
-The `gbif_api.py` module wraps the [GBIF Occurrence API](https://www.gbif.org/developer/occurrence) and supports filters such as dataset, taxon, and location. This example fetches the first five Eurasian blackbird observations recorded in the Netherlands:
+Voer de Streamlit-app lokaal uit:
 
-```
-python - <<'PY'
-from gbif_api import search_occurrences
-
-response = search_occurrences(taxon_key=5231190, country="NL", limit=5)
-for record in response.get("results", []):
-    species = record.get("species")
-    lat = record.get("decimalLatitude")
-    lon = record.get("decimalLongitude")
-    print(species, lat, lon)
-PY
-```
-
-### How to run the Streamlit app
-
-```
+```bash
 streamlit run streamlit_app.py
 ```
+
+De webapp draait standaard op <http://localhost:8501>. Gebruik de sidebar om filters aan te passen: meerdere locaties toevoegen, datumrange, activiteit, en maximale recordlimiet.
+
+## Belangrijkste functionaliteit
+
+- **Scraper**: `waarneming_scraper.py` haalt observaties op rechtstreeks van waarneming.nl en verrijkt ieder record met exacte coördinaten.
+- **Caching**: resultaten worden lokaal opgeslagen in `notes.db` (SQLite) zodat herladen sneller gaat; gebruik de knop *Verversen* om de cache te legen en opnieuw te scrapen.
+- **Notities**: in de app kunnen statussen/opmerkingen per observatie bijgehouden worden; deze worden eveneens in `notes.db` bewaard.
+- **Locatie-aliases**: standaard worden waarnemingen voor ’s-Hertogenbosch, Rosmalen en Empel gecombineerd; extra locaties kunnen via de sidebar worden toegevoegd.
+
+## Ontwikkeltips
+
+- De scraper gebruikt een gestandaardiseerde lijst van kolommen (`EXPECTED_COLUMNS`). Pas deze alleen aan als upload- of UI-code mee muteert.
+- Wanneer je code wijzigt die onder `@st.cache_data` valt, vergeet niet via de *Verversen*-knop de cache te legen om nieuwe resultaten te zien.
